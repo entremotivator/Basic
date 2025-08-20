@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS saved_searches (
 );"""
 }
 
-# FIXED Index creation statements - Better GIN syntax
+# PROPERLY FIXED Index creation statements - Correct operator classes
 INDEX_SCHEMAS = {
     # Basic B-tree indexes for foreign keys and common queries
     "idx_properties_user_id": "CREATE INDEX IF NOT EXISTS idx_properties_user_id ON properties(user_id);",
@@ -166,21 +166,28 @@ INDEX_SCHEMAS = {
     "idx_portfolio_analytics_date": "CREATE INDEX IF NOT EXISTS idx_portfolio_analytics_date ON portfolio_analytics(calculation_date);",
     "idx_saved_searches_user_id": "CREATE INDEX IF NOT EXISTS idx_saved_searches_user_id ON saved_searches(user_id);",
     
-    # FIXED GIN indexes for JSONB columns - proper syntax
+    # GIN indexes for JSONB columns (these work correctly)
     "idx_properties_data_gin": "CREATE INDEX IF NOT EXISTS idx_properties_data_gin ON properties USING GIN (data);",
     "idx_properties_search_params_gin": "CREATE INDEX IF NOT EXISTS idx_properties_search_params_gin ON properties USING GIN (search_params);",
     "idx_market_alerts_criteria_gin": "CREATE INDEX IF NOT EXISTS idx_market_alerts_criteria_gin ON market_alerts USING GIN (criteria);",
     "idx_user_preferences_notifications_gin": "CREATE INDEX IF NOT EXISTS idx_user_preferences_notifications_gin ON user_preferences USING GIN (notifications);",
     "idx_saved_searches_criteria_gin": "CREATE INDEX IF NOT EXISTS idx_saved_searches_criteria_gin ON saved_searches USING GIN (search_criteria);",
     
-    # GIN indexes for array columns
+    # GIN indexes for TEXT[] arrays (these work correctly)
     "idx_properties_tags_gin": "CREATE INDEX IF NOT EXISTS idx_properties_tags_gin ON properties USING GIN (tags);",
     "idx_property_comparisons_ids_gin": "CREATE INDEX IF NOT EXISTS idx_property_comparisons_ids_gin ON property_comparisons USING GIN (property_ids);",
     
-    # Expression indexes for commonly queried JSONB fields
+    # B-tree expression indexes for commonly queried JSONB fields (safer than GIN on text)
     "idx_properties_price": "CREATE INDEX IF NOT EXISTS idx_properties_price ON properties USING BTREE (((data->>'price')::NUMERIC)) WHERE data ? 'price';",
     "idx_properties_bedrooms": "CREATE INDEX IF NOT EXISTS idx_properties_bedrooms ON properties USING BTREE (((data->>'bedrooms')::INTEGER)) WHERE data ? 'bedrooms';",
     "idx_properties_property_type": "CREATE INDEX IF NOT EXISTS idx_properties_property_type ON properties USING BTREE ((data->>'property_type')) WHERE data ? 'property_type';",
+    
+    # Text search indexes using GIN with proper operator classes
+    "idx_api_usage_query_fulltext": "CREATE INDEX IF NOT EXISTS idx_api_usage_query_fulltext ON api_usage USING GIN (to_tsvector('english', query));",
+    "idx_market_alerts_location_fulltext": "CREATE INDEX IF NOT EXISTS idx_market_alerts_location_fulltext ON market_alerts USING GIN (to_tsvector('english', location)) WHERE location IS NOT NULL;",
+    
+    # GiST indexes for more complex JSONB operations (alternative to GIN)
+    "idx_properties_data_gist": "CREATE INDEX IF NOT EXISTS idx_properties_data_gist ON properties USING GIST (data);",
 }
 
 # RLS (Row Level Security) policies
@@ -431,26 +438,90 @@ with tab1:
     # Step 1: What was fixed
     with st.expander("🔧 What Was Fixed in This Version", expanded=True):
         st.markdown("""
-        **Fixed Issues:**
+        **Latest Fix - GIN Operator Class Error:**
         
-        1. **GIN Index Syntax**: Changed from invalid `(data->>'price')` to proper `(data)` syntax
-        2. **Better Index Organization**: Separated basic, GIN, and expression indexes
-        3. **Error Handling**: Added better validation and error reporting
-        4. **Expression Indexes**: Added proper BTREE indexes for commonly queried JSONB fields
-        
-        **Before (BROKEN):**
-        ```sql
-        -- This was invalid syntax:
-        CREATE INDEX idx_properties_price ON properties USING GIN ((data->>'price'));
+        **❌ The Problem:**
+        ```
+        ERROR: 42704: data type text has no default operator class for access method "gin"
+        HINT: You must specify an operator class for the index or define a default operator class for the data type.
         ```
         
-        **After (FIXED):**
-        ```sql
-        -- Full JSONB GIN index:
-        CREATE INDEX idx_properties_data_gin ON properties USING GIN (data);
+        **✅ The Solution:**
         
-        -- Specific field BTREE index:
-        CREATE INDEX idx_properties_price ON properties USING BTREE (((data->>'price')::NUMERIC)) WHERE data ? 'price';
+        1. **Removed invalid GIN indexes on TEXT fields**
+        2. **Added proper full-text search indexes using `to_tsvector`**  
+        3. **Used GiST as alternative for complex JSONB operations**
+        4. **Kept only valid GIN indexes (JSONB and arrays)**
+        
+        **Fixed Index Types:**
+        
+        **✅ Valid GIN indexes:**
+        ```sql
+        -- JSONB columns (work perfectly with GIN)
+        CREATE INDEX idx_properties_data_gin ON properties USING GIN (data);
+        CREATE INDEX idx_market_alerts_criteria_gin ON market_alerts USING GIN (criteria);
+        
+        -- Array columns (work perfectly with GIN) 
+        CREATE INDEX idx_properties_tags_gin ON properties USING GIN (tags);
+        ```
+        
+        **✅ Text search with proper operator class:**
+        ```sql
+        -- Full-text search with to_tsvector
+        CREATE INDEX idx_api_usage_query_fulltext ON api_usage 
+        USING GIN (to_tsvector('english', query));
+        ```
+        
+        **✅ BTREE for specific field queries:**
+        ```sql
+        -- Numeric and text field extraction
+        CREATE INDEX idx_properties_price ON properties 
+        USING BTREE (((data->>'price')::NUMERIC)) 
+        WHERE data ? 'price';
+        ```
+        
+        **✅ GiST as GIN alternative:**
+        ```sql
+        -- For complex JSONB operations
+        CREATE INDEX idx_properties_data_gist ON properties USING GIST (data);
+        ```
+        """)
+    
+    # Step 2: Understanding PostgreSQL Index Types
+    with st.expander("📚 PostgreSQL Index Types Explained", expanded=False):
+        st.markdown("""
+        **Index Types and Their Use Cases:**
+        
+        **🔷 B-tree (Default)**
+        - Use for: Equality, range queries, sorting
+        - Data types: Numbers, text, dates, UUIDs
+        - Example: `WHERE user_id = 123`, `WHERE price > 500000`
+        
+        **🔷 GIN (Generalized Inverted Index)**  
+        - Use for: Full-text search, JSONB, arrays
+        - Data types: JSONB, arrays, tsvector
+        - Example: `WHERE data @> '{"type":"house"}'`, `WHERE 'pool' = ANY(tags)`
+        
+        **🔷 GiST (Generalized Search Tree)**
+        - Use for: Geometric data, complex JSONB queries
+        - Data types: Geometric types, JSONB (alternative to GIN)
+        - Example: Complex JSONB operations, spatial queries
+        
+        **🔷 Hash**
+        - Use for: Simple equality only
+        - Data types: Any, but limited use cases
+        - Example: `WHERE id = 123` (equality only, no ranges)
+        
+        **❌ Common Mistakes:**
+        ```sql
+        -- WRONG - GIN can't index plain TEXT without operator class
+        CREATE INDEX bad_index ON table USING GIN (text_column);
+        
+        -- RIGHT - Use to_tsvector for text search
+        CREATE INDEX good_index ON table USING GIN (to_tsvector('english', text_column));
+        
+        -- RIGHT - Use B-tree for simple text queries
+        CREATE INDEX simple_index ON table (text_column);
         ```
         """)
     
@@ -792,63 +863,95 @@ $ LANGUAGE plpgsql SECURITY DEFINER;
                 st.info("💡 Custom SQL execution requires RPC function setup in Supabase")
                 st.code(custom_query, language="sql")
     
-    # SQL Tips with FIXED index examples
-    with st.expander("💡 SQL Tips for Real Estate Data (Updated for Fixed Indexes)"):
+        # SQL Tips with PROPERLY FIXED index examples
+    with st.expander("💡 SQL Tips for Real Estate Data (Final Fixed Version)", expanded=True):
         st.markdown("""
         **Working with JSONB properties data:**
         - `data->>'price'` extracts price as text
         - `(data->>'price')::NUMERIC` converts to number
-        - `data ? 'bedrooms'` checks if key exists (uses GIN index)
-        - `data @> '{"type": "house"}'` contains check (uses GIN index)
+        - `data ? 'bedrooms'` checks if key exists (uses GIN index on JSONB)
+        - `data @> '{"type": "house"}'` contains check (uses GIN index on JSONB)
         - `data->'features'` extracts nested JSON
         
-        **Index-Optimized Query Patterns:**
+        **✅ Index-Optimized Query Patterns (FIXED):**
         
-        **✅ Uses GIN index on full JSONB:**
+        **🔷 Uses GIN index on JSONB columns:**
         ```sql
-        -- Containment queries
+        -- JSONB containment queries (fast with GIN)
         WHERE data @> '{"property_type": "house"}'
         WHERE data @> '{"bedrooms": 3, "bathrooms": 2}'
+        WHERE search_params @> '{"location": "Seattle"}'
         
-        -- Key existence
+        -- JSONB key existence (fast with GIN)
         WHERE data ? 'price'
-        WHERE data ? 'square_feet'
+        WHERE data ?& ARRAY['price', 'bedrooms']  -- all keys exist
+        WHERE data ?| ARRAY['pool', 'spa']        -- any key exists
         ```
         
-        **✅ Uses Expression BTREE indexes:**
+        **🔷 Uses B-tree Expression indexes:**
         ```sql
-        -- Price range queries
+        -- Numeric field queries (uses expression index)
         WHERE (data->>'price')::NUMERIC BETWEEN 200000 AND 500000
         WHERE (data->>'bedrooms')::INTEGER >= 3
+        WHERE (data->>'bathrooms')::NUMERIC >= 2.5
+        
+        -- Text field queries (uses expression index)
         WHERE data->>'property_type' = 'house'
+        WHERE data->>'city' = 'Seattle'
         ```
         
-        **✅ Uses Array GIN indexes:**
+        **🔷 Uses GIN indexes on arrays:**
         ```sql
-        -- Array containment
+        -- Array containment (fast with GIN on arrays)
         WHERE 'pool' = ANY(tags)
-        WHERE tags @> ARRAY['garage', 'fireplace']
+        WHERE tags @> ARRAY['garage', 'fireplace']  -- contains all
+        WHERE tags && ARRAY['pool', 'spa']          -- overlaps with
         WHERE array_length(tags, 1) > 2
         ```
         
-        **🚀 Advanced Patterns:**
+        **🔷 Uses full-text search GIN indexes:**
         ```sql
-        -- Combined JSONB + array query
-        SELECT * FROM properties 
-        WHERE data @> '{"property_type": "house"}'
-          AND (data->>'price')::NUMERIC < 500000
-          AND 'garage' = ANY(tags);
+        -- Text search queries (uses GIN with to_tsvector)
+        WHERE to_tsvector('english', query) @@ to_tsquery('seattle & house')
+        WHERE to_tsvector('english', location) @@ plainto_tsquery('downtown seattle')
+        ```
         
-        -- Aggregations with JSONB
-        SELECT 
-          data->>'property_type' as type,
-          COUNT(*),
-          AVG((data->>'price')::NUMERIC)
-        FROM properties
-        WHERE data ? 'price'
-        GROUP BY data->>'property_type';
+        **🔷 Uses GiST for complex JSONB operations:**
+        ```sql
+        -- Complex JSONB queries that might use GiST
+        WHERE data <@ '{"property_type": ["house", "condo"]}'
+        ```
+        
+        **🚀 Advanced Combined Patterns:**
+        ```sql
+        -- Multi-index query (PostgreSQL will choose best combination)
+        SELECT * FROM properties 
+        WHERE data @> '{"property_type": "house"}'           -- GIN on JSONB
+          AND (data->>'price')::NUMERIC < 500000             -- B-tree expression
+          AND user_id = 123                                  -- B-tree
+          AND 'garage' = ANY(tags);                          -- GIN on array
+        
+        -- Full-text + JSONB search
+        SELECT p.*, ts_rank(to_tsvector('english', p.data->>'description'), query) as rank
+        FROM properties p, to_tsquery('luxury & modern') query
+        WHERE to_tsvector('english', p.data->>'description') @@ query
+          AND p.data @> '{"property_type": "house"}'
+        ORDER BY rank DESC;
+        ```
+        
+        **❌ AVOID - Patterns that prevent index usage:**
+        ```sql
+        -- Can't use any index - function on indexed column
+        WHERE LOWER(data->>'property_type') = 'house'  -- Use: = 'house' instead
+        
+        -- Can't use GIN efficiently - negation
+        WHERE NOT (data @> '{"type": "condo"}')        -- Restructure query
+        
+        -- Can't use expression index - wrong data type operation
+        WHERE (data->>'price') LIKE '5%'               -- Use: CAST and range instead
         ```
         """)
+    
 
 # ------------------------
 # Tab 3: Data Entry Forms
